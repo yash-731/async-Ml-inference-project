@@ -1,0 +1,91 @@
+name: ml-inference-service
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: forecast
+      POSTGRES_PASSWORD: forecast
+      POSTGRES_DB: forecast
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forecast -d forecast"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # One-shot migration service. The API and worker wait for it to exit 0, so
+  # neither ever talks to a database whose schema is behind the code.
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://forecast:forecast@postgres:5432/forecast
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    command: ["/app/scripts/start-api.sh"]
+    environment:
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+      JSON_LOGS: "true"
+      DATABASE_URL: postgresql+psycopg://forecast:forecast@postgres:5432/forecast
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_DIR: /data/uploads
+    ports:
+      - "8000:8000"
+    volumes:
+      # Shared with the worker: the API writes the CSV, the worker reads it.
+      - uploads:/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  worker:
+    build: .
+    command: ["/app/scripts/start-worker.sh"]
+    environment:
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+      JSON_LOGS: "true"
+      DATABASE_URL: postgresql+psycopg://forecast:forecast@postgres:5432/forecast
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_DIR: /data/uploads
+      CELERY_CONCURRENCY: "2"
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  uploads:
